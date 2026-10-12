@@ -41,19 +41,6 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
-      - name: Stage binary and checksums
-        run: |
-          mkdir -p dist
-          cp target/release/clipd dist/clipd
-          strip dist/clipd
-          # Self-updater assets (see src/update.rs::select_assets).
-          cp dist/clipd "clipd-${{ matrix.arch }}"
-          sha256sum "clipd-${{ matrix.arch }}" > "clipd-${{ matrix.arch }}.sha256"
-          if [ "${{ matrix.arch }}" = "x86_64" ]; then
-            cp "clipd-${{ matrix.arch }}" clipd
-            cp "clipd-${{ matrix.arch }}.sha256" clipd.sha256
-          fi
-
       - name: Install nfpm
         run: |
           curl -sSL -o nfpm.tgz \
@@ -62,34 +49,54 @@ jobs:
           sudo install -m 0755 nfpm /usr/local/bin/nfpm
           nfpm --version
 
-      - name: Build .deb / .rpm / Arch / Alpine packages
+      - name: Build binaries and packages
         env:
           VERSION: ${{ github.ref_name }}
           ARCH: ${{ matrix.nfpm_arch }}
         run: |
           set -eux
           ver="${VERSION#v}"
+          mkdir -p dist
+          cp target/release/clipd dist/clipd
+          strip dist/clipd
+          # Self-updater asset + checksum (see src/update.rs::select_assets).
+          cp dist/clipd "dist/clipd-${{ matrix.arch }}"
+          ( cd dist && sha256sum "clipd-${{ matrix.arch }}" > "clipd-${{ matrix.arch }}.sha256" )
+          # Legacy un-suffixed aliases are the x86_64 build (backwards compat).
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            ( cd dist && sha256sum clipd > clipd.sha256 )
+          fi
+          # Native packages for every major distro family.
           for fmt in deb rpm archlinux apk; do
             VERSION="$ver" ARCH="$ARCH" nfpm package \
               -f packaging/nfpm.yaml -p "$fmt" -t dist/
           done
-          # Checksums for the packages too.
-          (cd dist && sha256sum *.deb *.rpm *.pkg.tar.zst *.apk > packages.sha256 && cat packages.sha256)
+          ( cd dist && sha256sum *.deb *.rpm *.pkg.tar.zst *.apk > packages.sha256 )
           ls -l dist
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload architecture binary, checksums and packages
+        uses: actions/upload-artifact@v4
         with:
           name: clipd-${{ matrix.arch }}
+          # Every path lives under dist/, so the artifact stores flat filenames.
           path: |
-            clipd-${{ matrix.arch }}
-            clipd-${{ matrix.arch }}.sha256
-            clipd
-            clipd.sha256
+            dist/clipd-${{ matrix.arch }}
+            dist/clipd-${{ matrix.arch }}.sha256
             dist/*.deb
             dist/*.rpm
             dist/*.pkg.tar.zst
             dist/*.apk
             dist/packages.sha256
+          if-no-files-found: error
+
+      - name: Upload legacy x86_64 aliases
+        if: matrix.arch == 'x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipd-legacy-x86_64
+          path: |
+            dist/clipd
+            dist/clipd.sha256
           if-no-files-found: error
 
   release:
@@ -100,6 +107,9 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: List collected assets
+        run: ls -lR dist
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
