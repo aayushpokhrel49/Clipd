@@ -1,15 +1,19 @@
 # clipd
 
-A small, fast, persistent clipboard manager for **X11** desktops (built and tested on
-Linux Mint / Cinnamon). It watches your clipboard, saves everything you copy — text
-**and images** — to disk, and lets you pop up a searchable list whenever you want to
-paste something you copied earlier.
+A small, fast, persistent clipboard manager for **X11** desktops. It runs on any
+X11 Linux distribution and works with any window manager or desktop environment
+(GNOME, KDE Plasma, XFCE, Cinnamon, MATE, LXQt, i3, Sway-on-XWayland, ...). It
+watches your clipboard, saves everything you copy — text **and images** — to disk,
+and lets you pop up a searchable list whenever you want to paste something you
+copied earlier.
 
 - Event-driven (no polling), light on RAM/CPU.
 - Saves history to disk, so it survives app shutdowns and reboots.
-- Captures **text and images**.
+- Captures **text and images** (PNG, JPEG, GIF, WebP, BMP, TIFF, ...).
 - Global hotkey **Ctrl+Alt+V** opens a searchable popup; click / Enter to paste.
-- **Auto-pastes** into the focused window after you pick an item.
+- **Auto-pastes** into the focused window after you pick an item — using
+  **Ctrl+Shift+V** in terminals and **Ctrl+V** everywhere else.
+- Full keyboard navigation: arrows, Page Up/Down, Home/End, Delete, Esc.
 - Skips clipboard content flagged by password managers.
 
 ## Requirements
@@ -19,17 +23,19 @@ paste something you copied earlier.
 optional self-updater shells out to `curl` (and `sha256sum`); updates are skipped
 if those are missing.
 
-- A running **X11** session (not Wayland).
-- GTK3 runtime (`libgtk-3-0`) — present on essentially every desktop.
+- A running **X11** session (not native Wayland — see limitations below).
+- GTK3 runtime — present on essentially every desktop.
 
 Building from source additionally needs the GTK3 development headers and a Rust
-toolchain:
+toolchain (`cargo --version`, 1.70+ recommended):
 
-```
-sudo apt install build-essential pkg-config libgtk-3-dev libglib2.0-dev \
-                 libgdk-pixbuf-2.0-dev libcairo2-dev
-cargo --version   # 1.70+ recommended
-```
+| Distribution       | Command                                                                 |
+|--------------------|-------------------------------------------------------------------------|
+| Debian / Ubuntu / Mint | `sudo apt install build-essential pkg-config libgtk-3-dev libglib2.0-dev libgdk-pixbuf-2.0-dev libcairo2-dev` |
+| Fedora / RHEL      | `sudo dnf install gcc pkg-config gtk3-devel glib2-devel gdk-pixbuf2-devel cairo-devel` |
+| Arch / Manjaro     | `sudo pacman -S base-devel pkgconf gtk3 glib2 gdk-pixbuf2 cairo`        |
+| openSUSE           | `sudo zypper install gcc pkg-config gtk3-devel glib2-devel gdk-pixbuf-devel cairo-devel` |
+| Alpine             | `sudo apk add build-base pkgconf gtk+3.0-dev glib-dev gdk-pixbuf-dev cairo-dev` |
 
 ## Build & install
 
@@ -61,11 +67,13 @@ cargo build --release
 Once the daemon is running:
 
 - **Copy anything** (Ctrl+C). It is appended to history and persisted.
-- Press **Ctrl+Alt+V** anywhere to open the popup near the mouse pointer.
-- Type to filter. Use **Up/Down** to move, **Enter** or **click** to choose,
-  **Delete** to remove an entry, **Esc** to close.
+- Press **Ctrl+Alt+V** anywhere to open the popup near the mouse pointer
+  (works regardless of whether NumLock/CapsLock/ScrollLock are on).
+- Type to filter. Use **Up/Down**, **Page Up/Down**, **Home/End** to move,
+  **Enter** or **click** to choose, **Delete** to remove an entry, **Esc** to close.
 - Choosing an entry puts it on the clipboard, restores focus to the previous
-  window, and sends **Ctrl+V** for you.
+  window, and sends **Ctrl+Shift+V** to terminals or **Ctrl+V** to other apps.
+- Drag the popup header to reposition it; its location is remembered.
 
 Only one instance runs at a time: launching `clipd` again talks to the running
 daemon (over the session D-Bus) and toggles the popup.
@@ -105,13 +113,17 @@ restarts automatically. A desktop notification reports what happened.
 ### Publishing a release
 
 Tag a commit and push the tag; the workflow in `.github/workflows/release.yml`
-builds the binary and attaches `clipd` + `clipd.sha256` to a GitHub release:
+builds `x86_64` and `aarch64` binaries and attaches them to a GitHub release:
 
 ```
 # bump `version` in Cargo.toml first
 git tag v0.1.1
 git push origin v0.1.1
 ```
+
+The updater downloads the asset matching the running CPU architecture
+(`clipd-x86_64` / `clipd-aarch64`). The legacy `clipd` asset is also kept so
+older install scripts keep working.
 
 ## Uninstall
 
@@ -123,13 +135,18 @@ rm -rf ~/.local/share/clipd
 
 ## Notes & limitations
 
-- **X11 only.** There is no Wayland session support in this version.
-- Native Wayland apps do not expose their clipboard through the X11 protocol and
-  will not be captured.
-- Auto-paste is best-effort: it restores focus to the window that was focused when
-  the popup opened, then synthesizes Ctrl+V. If a target app ignores synthetic
-  input, the item is still on the clipboard — just press Ctrl+V yourself.
+- **X11 based.** It works on native X11 sessions and on Wayland desktops through
+  XWayland (e.g. GNOME, KDE Plasma and Cinnamon run GTK apps under XWayland).
+  Native Wayland-only apps do not expose their clipboard through the X11
+  protocol and will not be captured.
+- Auto-paste is best-effort: it asks the window manager to focus the previous
+  window (`_NET_ACTIVE_WINDOW`), falls back to a direct focus request, then
+  synthesizes the right paste shortcut. If a target app ignores synthetic input,
+  the item is still on the clipboard — just press Ctrl+V yourself.
+- If the **Ctrl+Alt+V** grab is already taken by another application, the
+  clipboard watcher still runs; just use `clipd toggle` to open the popup.
 - If another clipboard manager is running, the two may compete for clipboard
   ownership.
 - The popup builds at most 400 matching rows at a time; type more of the text
-  to narrow the search and reach older entries.
+  to narrow the search and reach older entries. The popup automatically shrinks
+  to fit small screens and high display scaling.

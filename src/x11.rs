@@ -12,6 +12,7 @@ pub enum XOut {
 
 const XK_V: u32 = 0x0076;
 const XK_CONTROL_L: u32 = 0xffe3;
+const XK_SHIFT_L: u32 = 0xffe1;
 
 pub fn spawn(tx: glib::Sender<XOut>) {
     let res = std::thread::Builder::new()
@@ -39,7 +40,10 @@ fn run(tx: &glib::Sender<XOut>) -> anyhow::Result<()> {
         lookup_keycode(&conn, XK_V).ok_or_else(|| anyhow::anyhow!("cannot find keycode for V"))?;
 
     let base = ModMask::CONTROL | ModMask::M1;
+    // Also grab every combination with NumLock/CapsLock/ScrollLock so the
+    // hotkey keeps working regardless of which lock modifiers are active.
     let lock_bits = [ModMask::LOCK, ModMask::M2, ModMask::M3, ModMask::M5];
+    let mut grabbed = 0u32;
     for combo in 0..16u8 {
         let mut mask = base;
         for (bit, lm) in lock_bits.iter().enumerate() {
@@ -47,7 +51,7 @@ fn run(tx: &glib::Sender<XOut>) -> anyhow::Result<()> {
                 mask |= *lm;
             }
         }
-        xproto::grab_key(
+        let result = match xproto::grab_key(
             &conn,
             false,
             root,
@@ -55,8 +59,19 @@ fn run(tx: &glib::Sender<XOut>) -> anyhow::Result<()> {
             v_keycode,
             GrabMode::ASYNC,
             GrabMode::ASYNC,
-        )?
-        .check()?;
+        ) {
+            Ok(cookie) => cookie.check().map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match result {
+            Ok(()) => grabbed += 1,
+            // A conflict simply means another app already owns Ctrl+Alt+V;
+            // that must not take the whole daemon (and clipboard watching) down.
+            Err(e) => log::warn!("could not grab Ctrl+Alt+V ({mask:?}): {e}"),
+        }
+    }
+    if grabbed == 0 {
+        log::warn!("Ctrl+Alt+V is already in use by another program; use `clipd toggle` instead");
     }
 
     xfixes::select_selection_input(
@@ -136,24 +151,128 @@ fn do_paste(window: u32) -> anyhow::Result<()> {
     let root = conn.setup().roots[screen_num].root;
     let _ = xtest::get_version(&conn, 2, 2)?.reply();
 
-    let ctrl = lookup_keycode(&conn, XK_CONTROL_L)
-        .ok_or_else(|| anyhow::anyhow!("no Control keycode"))?;
-    let v = lookup_keycode(&conn, XK_V).ok_or_else(|| anyhow::anyhow!("no V keycode"))?;
+    let terminal = window != 0 && is_terminal(&conn, window);
+    log::debug!("auto-paste: target window={window} terminal={terminal}");
 
     if window != 0 {
-        xproto::set_input_focus(&conn, InputFocus::POINTER_ROOT, window, x11rb::CURRENT_TIME)?
-            .check()?;
+        // Ask the window manager to focus the target window (EWMH), then fall
+        // back to a direct focus request for unmanaged/override-redirect ones.
+        let _ = activate(&conn, root, window);
+        conn.flush()?;
+        std::thread::sleep(Duration::from_millis(50));
+        if let Ok(cookie) =
+            xproto::set_input_focus(&conn, InputFocus::POINTER_ROOT, window, x11rb::CURRENT_TIME)
+        {
+            let _ = cookie.check();
+        }
         conn.flush()?;
         std::thread::sleep(Duration::from_millis(60));
     }
 
-    fake_key(&conn, root, ctrl, true)?;
-    std::thread::sleep(Duration::from_millis(15));
-    fake_key(&conn, root, v, true)?;
-    std::thread::sleep(Duration::from_millis(25));
-    fake_key(&conn, root, v, false)?;
-    std::thread::sleep(Duration::from_millis(15));
-    fake_key(&conn, root, ctrl, false)?;
+    let ctrl = lookup_keycode(&conn, XK_CONTROL_L)
+        .ok_or_else(|| anyhow::anyhow!("no Control keycode"))?;
+    let v = lookup_keycode(&conn, XK_V).ok_or_else(|| anyhow::anyhow!("no V keycode"))?;
+    let shift = lookup_keycode(&conn, XK_SHIFT_L);
+
+    // Terminal emulators paste with Ctrl+Shift+V; every other app uses Ctrl+V.
+    let mut sequence: Vec<(u8, bool)> = Vec::new();
+    sequence.push((ctrl, true));
+    if terminal {
+        if let Some(shift) = shift {
+            sequence.push((shift, true));
+        }
+    }
+    sequence.push((v, true));
+    sequence.push((v, false));
+    if terminal {
+        if let Some(shift) = shift {
+            sequence.push((shift, false));
+        }
+    }
+    sequence.push((ctrl, false));
+
+    for (keycode, press) in sequence {
+        fake_key(&conn, root, keycode, press)?;
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    Ok(())
+}
+
+/// Substrings of terminal-emulator window classes that need Ctrl+Shift+V.
+const TERMINALS: &[&str] = &[
+    "terminal",
+    "konsole",
+    "xterm",
+    "urxvt",
+    "rxvt",
+    "alacritty",
+    "kitty",
+    "terminator",
+    "tilix",
+    "wezterm",
+    "foot",
+    "ghostty",
+    "stterm",
+    "hyper",
+    "qterminal",
+    "lxterminal",
+];
+
+/// True when the window's `WM_CLASS` looks like a terminal emulator.
+fn is_terminal(conn: &RustConnection, window: u32) -> bool {
+    let reply = xproto::get_property(
+        conn,
+        false,
+        window,
+        xproto::AtomEnum::WM_CLASS,
+        xproto::AtomEnum::STRING,
+        0,
+        1024,
+    )
+    .ok()
+    .and_then(|cookie| cookie.reply().ok());
+    let Some(reply) = reply else {
+        return false;
+    };
+    class_is_terminal(&String::from_utf8_lossy(&reply.value))
+}
+
+fn class_is_terminal(class: &str) -> bool {
+    let class = class.to_lowercase();
+    TERMINALS.iter().any(|t| class.contains(t))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_class_detection() {
+        assert!(class_is_terminal("gnome-terminal-server\0Gnome-terminal\0"));
+        assert!(class_is_terminal("Konsole\0konsole\0"));
+        assert!(class_is_terminal("Alacritty\0Alacritty\0"));
+        assert!(class_is_terminal("xterm\0XTerm\0"));
+        assert!(!class_is_terminal("me.aayush.Aaykra\0me.aayush.Aaykra\0"));
+        assert!(!class_is_terminal("firefox\0Firefox\0"));
+        assert!(!class_is_terminal("code\0Code\0"));
+    }
+}
+
+/// Ask the window manager to activate `window` (EWMH `_NET_ACTIVE_WINDOW`).
+fn activate(conn: &RustConnection, root: u32, window: u32) -> anyhow::Result<()> {
+    let atom = xproto::intern_atom(conn, false, b"_NET_ACTIVE_WINDOW")?
+        .reply()?
+        .atom;
+    let event =
+        xproto::ClientMessageEvent::new(32, window, atom, [2u32, x11rb::CURRENT_TIME, 0, 0, 0]);
+    xproto::send_event(
+        conn,
+        false,
+        root,
+        xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+        event,
+    )?
+    .check()?;
     Ok(())
 }
 

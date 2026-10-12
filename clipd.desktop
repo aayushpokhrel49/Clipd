@@ -7,4 +7,5 @@ Icon=edit-copy
 Terminal=false
 Categories=Utility;
 NoDisplay=false
+StartupNotify=false
 X-GNOME-Autostart-enabled=true

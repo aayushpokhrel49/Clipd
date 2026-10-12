@@ -21,8 +21,12 @@ pub fn read(clip: &Clipboard) -> Option<Content> {
         "image/bmp",
         "image/tiff",
         "image/jpeg",
+        "image/jpg",
+        "image/gif",
+        "image/webp",
         "image/x-bmp",
         "image/x-MS-bmp",
+        "image/x-icon",
     ]
     .iter()
     .map(|s| gdk::Atom::intern(s))
@@ -38,7 +42,9 @@ pub fn read(clip: &Clipboard) -> Option<Content> {
         "UTF8_STRING",
         "STRING",
         "TEXT",
+        "COMPOUND_TEXT",
         "text/plain;charset=utf-8",
+        "text/plain;charset=UTF-8",
         "text/plain",
     ]
     .iter()

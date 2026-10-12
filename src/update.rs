@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -133,32 +134,60 @@ pub fn check() -> anyhow::Result<Option<Release>> {
         return Ok(None);
     }
 
-    let mut url = None;
-    let mut checksum_url = None;
-    if let Some(assets) = json.get("assets").and_then(Value::as_array) {
-        for asset in assets {
-            let name = asset.get("name").and_then(Value::as_str).unwrap_or_default();
-            let dl = asset
-                .get("browser_download_url")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if dl.is_empty() {
-                continue;
-            }
-            if name == "clipd.sha256" {
-                checksum_url = Some(dl.to_string());
-            } else if name == "clipd" || name == "clipd-linux-x86_64" {
-                url = Some(dl.to_string());
-            }
-        }
-    }
+    let assets: HashMap<&str, &str> = json
+        .get("assets")
+        .and_then(Value::as_array)
+        .map(|assets| {
+            assets
+                .iter()
+                .filter_map(|asset| {
+                    let name = asset.get("name").and_then(Value::as_str)?;
+                    let dl = asset.get("browser_download_url").and_then(Value::as_str)?;
+                    (!dl.is_empty()).then_some((name, dl))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
-    let url = url.ok_or_else(|| anyhow!("release v{version} has no clipd binary asset"))?;
+    let arch = std::env::consts::ARCH;
+    let (url, checksum_url) = select_assets(&assets, arch).ok_or_else(|| {
+        anyhow!("release v{version} has no clipd binary asset for architecture {arch}")
+    })?;
+
     Ok(Some(Release {
         version,
-        url,
-        checksum_url,
+        url: url.to_string(),
+        checksum_url: checksum_url.map(str::to_string),
     }))
+}
+
+/// Choose the binary (and its checksum) that matches the running CPU
+/// architecture, preferring e.g. `clipd-aarch64` over a generic `clipd`.
+fn select_assets<'a>(
+    assets: &'a HashMap<&'a str, &'a str>,
+    arch: &str,
+) -> Option<(&'a str, Option<&'a str>)> {
+    let mut binaries = vec![
+        format!("clipd-{arch}"),
+        format!("clipd-linux-{arch}"),
+    ];
+    let mut checksums = vec![
+        format!("clipd-{arch}.sha256"),
+        format!("clipd-linux-{arch}.sha256"),
+    ];
+    // The un-suffixed legacy asset is the x86_64 build.
+    if arch == "x86_64" {
+        binaries.push("clipd".to_string());
+        checksums.push("clipd.sha256".to_string());
+    }
+
+    let url = binaries
+        .iter()
+        .find_map(|name| assets.get(name.as_str()).copied())?;
+    let checksum = checksums
+        .iter()
+        .find_map(|name| assets.get(name.as_str()).copied());
+    Some((url, checksum))
 }
 
 /// Download the release binary, verify it, and atomically replace the running
@@ -274,5 +303,37 @@ mod tests {
         assert!(!is_newer("0.1.0", "0.2.0"));
         assert!(!is_newer("0.2.0-beta", "0.2.0"));
         assert!(is_newer("0.2.1-beta", "0.2.0"));
+    }
+
+    #[test]
+    fn asset_selection_by_arch() {
+        let assets: HashMap<&str, &str> = [
+            ("clipd-x86_64", "u-x86"),
+            ("clipd-x86_64.sha256", "s-x86"),
+            ("clipd-aarch64", "u-arm"),
+            ("clipd-aarch64.sha256", "s-arm"),
+            ("clipd", "u-generic"),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            select_assets(&assets, "x86_64"),
+            Some(("u-x86", Some("s-x86")))
+        );
+        assert_eq!(
+            select_assets(&assets, "aarch64"),
+            Some(("u-arm", Some("s-arm")))
+        );
+        // Unknown arch must not silently grab the x86_64 generic binary.
+        assert_eq!(select_assets(&assets, "riscv64"), None);
+
+        let legacy: HashMap<&str, &str> =
+            [("clipd", "u-generic"), ("clipd.sha256", "s")].into_iter().collect();
+        assert_eq!(
+            select_assets(&legacy, "x86_64"),
+            Some(("u-generic", Some("s")))
+        );
+        assert_eq!(select_assets(&legacy, "aarch64"), None);
     }
 }

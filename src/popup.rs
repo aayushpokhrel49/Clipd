@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
 use gtk::{gdk, gdk_pixbuf};
@@ -19,6 +19,7 @@ const MAX_ROWS: usize = 400;
 
 const CSS: &str = r#"
 .clipd-window { background-color: transparent; }
+.clipd-window.clipd-opaque { background-color: @theme_bg_color; }
 .clipd-frame {
   background-color: @theme_bg_color;
   border: 1px solid alpha(@theme_fg_color, 0.18);
@@ -105,9 +106,12 @@ pub struct Popup {
     pub window: gtk::Window,
     search: gtk::SearchEntry,
     list: gtk::ListBox,
+    scroll: gtk::ScrolledWindow,
     status: gtk::Label,
+    opened_at: Rc<Cell<Instant>>,
     history: Rc<RefCell<Vec<ClipItem>>>,
     on_activate: Rc<dyn Fn(u64)>,
+    on_delete: Rc<dyn Fn(u64)>,
     filter: Rc<RefCell<String>>,
     ids: Rc<RefCell<Vec<u64>>>,
     images_dir: PathBuf,
@@ -126,7 +130,11 @@ impl Popup {
 
         let window = gtk::Window::new(gtk::WindowType::Toplevel);
         window.set_title("Clipboard");
-        window.set_type_hint(gdk::WindowTypeHint::PopupMenu);
+        // A managed "utility" window behaves correctly on every major desktop
+        // (GNOME, KDE, XFCE, Cinnamon, MATE, LXQt, i3, ...). A `PopupMenu` hint
+        // is left unmanaged by several window managers, which then never hand
+        // it keyboard focus — the usual cause of "keys do nothing".
+        window.set_type_hint(gdk::WindowTypeHint::Utility);
         window.set_skip_taskbar_hint(true);
         window.set_skip_pager_hint(true);
         window.set_decorated(false);
@@ -134,13 +142,22 @@ impl Popup {
         window.set_resizable(false);
         window.set_default_size(WIDTH, HEIGHT);
         window.set_accept_focus(true);
+        window.set_focus_on_map(true);
         window.style_context().add_class("clipd-window");
+        // Only enable RGBA when the screen really supports it; otherwise the
+        // transparent CSS background can show up as black on non-composited
+        // setups, so fall back to an opaque background.
+        let mut has_alpha = false;
         if let Some(screen) = gdk::Screen::default() {
             if let Some(visual) = screen.rgba_visual() {
                 window.set_visual(Some(&visual));
+                window.set_app_paintable(true);
+                has_alpha = true;
             }
         }
-        window.set_app_paintable(true);
+        if !has_alpha {
+            window.style_context().add_class("clipd-opaque");
+        }
 
         let minimize = gtk::Button::with_label("\u{2013}");
         minimize.set_relief(gtk::ReliefStyle::None);
@@ -223,6 +240,7 @@ impl Popup {
         Rc::new_cyclic(move |weak: &Weak<Popup>| {
             let filter = Rc::new(RefCell::new(String::new()));
             let ids = Rc::new(RefCell::new(Vec::new()));
+            let opened_at = Rc::new(Cell::new(Instant::now()));
 
             let drag: Rc<Cell<Option<DragStart>>> = Rc::new(Cell::new(None));
 
@@ -310,9 +328,52 @@ impl Popup {
 
             {
                 let list = list.clone();
+                let weak = weak.clone();
+                // Navigation lives here as well as on the list, because some
+                // window/GTK combinations keep keyboard focus on the entry.
                 search.connect_key_press_event(move |_, ev| match ev.keyval() {
-                    gdk::keys::constants::Down | gdk::keys::constants::Up => {
+                    gdk::keys::constants::Down => {
+                        if let Some(p) = weak.upgrade() {
+                            p.move_selection(1);
+                        }
                         list.grab_focus();
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::Up => {
+                        if let Some(p) = weak.upgrade() {
+                            p.move_selection(-1);
+                        }
+                        list.grab_focus();
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::Page_Down => {
+                        if let Some(p) = weak.upgrade() {
+                            p.move_selection(5);
+                        }
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::Page_Up => {
+                        if let Some(p) = weak.upgrade() {
+                            p.move_selection(-5);
+                        }
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::Home => {
+                        if let Some(p) = weak.upgrade() {
+                            p.select_index(0);
+                        }
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::End => {
+                        if let Some(p) = weak.upgrade() {
+                            p.select_last();
+                        }
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::Delete => {
+                        if let Some(p) = weak.upgrade() {
+                            p.delete_selected();
+                        }
                         glib::Propagation::Stop
                     }
                     _ => glib::Propagation::Proceed,
@@ -330,6 +391,7 @@ impl Popup {
                     }
                     let id = ids.borrow().get(idx as usize).copied();
                     if let Some(id) = id {
+                        log::debug!("activating row {idx} (id {id}) via click");
                         window.hide();
                         on_activate(id);
                     }
@@ -337,22 +399,52 @@ impl Popup {
             }
 
             {
-                let on_delete = on_delete.clone();
-                let ids = ids.clone();
-                let list_for_signal = list.clone();
                 let weak = weak.clone();
                 let search = search.clone();
                 list.connect_key_press_event(move |_, ev| match ev.keyval() {
+                    gdk::keys::constants::Down | gdk::keys::constants::Page_Down => {
+                        if let Some(p) = weak.upgrade() {
+                            let step = if ev.keyval() == gdk::keys::constants::Page_Down {
+                                5
+                            } else {
+                                1
+                            };
+                            p.move_selection(step);
+                        }
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::Up | gdk::keys::constants::Page_Up => {
+                        if let Some(p) = weak.upgrade() {
+                            let step = if ev.keyval() == gdk::keys::constants::Page_Up {
+                                -5
+                            } else {
+                                -1
+                            };
+                            p.move_selection(step);
+                        }
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::Home => {
+                        if let Some(p) = weak.upgrade() {
+                            p.select_index(0);
+                        }
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::End => {
+                        if let Some(p) = weak.upgrade() {
+                            p.select_last();
+                        }
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::Return | gdk::keys::constants::KP_Enter => {
+                        if let Some(p) = weak.upgrade() {
+                            p.activate_selected();
+                        }
+                        glib::Propagation::Stop
+                    }
                     gdk::keys::constants::Delete => {
-                        if let Some(row) = list_for_signal.selected_row() {
-                            let idx = row.index();
-                            let id = ids.borrow().get(idx as usize).copied();
-                            if let Some(id) = id {
-                                on_delete(id);
-                                if let Some(p) = weak.upgrade() {
-                                    p.refresh();
-                                }
-                            }
+                        if let Some(p) = weak.upgrade() {
+                            p.delete_selected();
                         }
                         glib::Propagation::Stop
                     }
@@ -399,10 +491,16 @@ impl Popup {
 
             {
                 let window2 = window.clone();
+                let opened_at = opened_at.clone();
                 window.connect_focus_out_event(move |_, _| {
                     let window2 = window2.clone();
-                    glib::timeout_add_local_once(Duration::from_millis(140), move || {
-                        if window2.is_visible() && !window2.is_active() {
+                    let opened_at = opened_at.clone();
+                    glib::timeout_add_local_once(Duration::from_millis(160), move || {
+                        // Ignore the focus churn that some window managers emit
+                        // right as the popup is mapped, or every synthetic
+                        // Ctrl+V we send would hide it instantly.
+                        let settled = opened_at.get().elapsed() > Duration::from_millis(300);
+                        if settled && window2.is_visible() && !window2.is_active() {
                             window2.hide();
                         }
                     });
@@ -414,9 +512,12 @@ impl Popup {
                 window,
                 search,
                 list,
+                scroll: scroll.clone(),
                 status,
+                opened_at,
                 history,
                 on_activate,
+                on_delete,
                 filter,
                 ids,
                 images_dir: store::images_dir(),
@@ -430,23 +531,35 @@ impl Popup {
         self.filter.borrow_mut().clear();
         self.search.set_text("");
         self.refresh();
+        self.opened_at.set(Instant::now());
 
         let (mut px, mut py) = store::load_pos().unwrap_or((x, y));
+        let mut width = WIDTH;
+        let mut height = HEIGHT;
         if let Some(display) = gdk::Display::default() {
             if let Some(mon) = display.monitor_at_point(px, py) {
                 let wa = mon.workarea();
-                px = px.max(wa.x()).min(wa.x() + wa.width() - WIDTH);
-                py = py.max(wa.y()).min(wa.y() + wa.height() - HEIGHT);
+                // Shrink to fit small screens / high display scaling instead of
+                // overflowing off-screen.
+                let max_w = (wa.width() - 24).max(200);
+                let max_h = (wa.height() - 24).max(200);
+                width = WIDTH.min(max_w);
+                height = HEIGHT.min(max_h);
+                px = px.clamp(wa.x(), (wa.x() + wa.width() - width).max(wa.x()));
+                py = py.clamp(wa.y(), (wa.y() + wa.height() - height).max(wa.y()));
             }
         }
 
+        self.scroll.set_min_content_height((height - 136).max(120));
+        self.window.resize(width, height);
         self.window.deiconify();
         self.window.move_(px, py);
         self.window.show_all();
         self.window.present();
         self.search.grab_focus();
-        if let Some(first) = self.list.row_at_index(0) {
-            self.list.select_row(Some(&first));
+        if !self.ids.borrow().is_empty() {
+            self.scroll.vadjustment().set_value(0.0);
+            self.select_index(0);
         }
     }
 
@@ -506,6 +619,7 @@ impl Popup {
 
         let total = history.len();
         let shown = ids.len();
+        drop(ids);
         let status = if shown == 0 {
             if filter.is_empty() {
                 "No clipboard history yet"
@@ -540,9 +654,76 @@ impl Popup {
 
         self.list.show_all();
         if shown > 0 {
-            if let Some(first) = self.list.row_at_index(0) {
-                self.list.select_row(Some(&first));
-            }
+            self.scroll.vadjustment().set_value(0.0);
+            self.select_index(0);
+        }
+    }
+
+    /// Highlight the visible row `index` positions away, clamped to the list.
+    fn move_selection(&self, delta: i32) {
+        let count = self.ids.borrow().len() as i32;
+        if count == 0 {
+            return;
+        }
+        let current = self
+            .list
+            .selected_row()
+            .map(|row| row.index())
+            .unwrap_or(0);
+        self.select_index((current + delta).clamp(0, count - 1));
+    }
+
+    fn select_index(&self, index: i32) {
+        let count = self.ids.borrow().len() as i32;
+        if count == 0 {
+            return;
+        }
+        if let Some(row) = self.list.row_at_index(index.clamp(0, count - 1)) {
+            self.list.select_row(Some(&row));
+            self.scroll_into_view(&row);
+        }
+    }
+
+    /// Keep the highlighted row visible. The list itself never holds keyboard
+    /// focus (the entry does), so GTK does not scroll to the selection for us —
+    /// which is why the mouse wheel worked but the arrow keys did not scroll.
+    fn scroll_into_view(&self, row: &gtk::ListBoxRow) {
+        let adj = self.scroll.vadjustment();
+        let height = row.allocation().height() as f64;
+        let top_of_row = row
+            .translate_coordinates(&self.list, 0, 0)
+            .map(|(_, y)| y as f64)
+            .unwrap_or(0.0);
+        let view_top = adj.value();
+        let page = adj.page_size();
+        let max_top = (adj.upper() - page).max(0.0);
+        log::debug!("scroll_into_view: row_top={top_of_row:.0} view_top={view_top:.0} page={page:.0}");
+
+        if top_of_row < view_top {
+            adj.set_value(top_of_row.max(0.0));
+        } else if top_of_row + height > view_top + page {
+            adj.set_value((top_of_row + height - page).min(max_top));
+        }
+    }
+
+    fn select_last(&self) {
+        let count = self.ids.borrow().len() as i32;
+        self.select_index(count - 1);
+    }
+
+    fn delete_selected(&self) {
+        let Some(row) = self.list.selected_row() else {
+            return;
+        };
+        let idx = row.index();
+        if idx < 0 {
+            return;
+        }
+        let id = self.ids.borrow().get(idx as usize).copied();
+        if let Some(id) = id {
+            log::debug!("deleting row {idx} (id {id})");
+            (self.on_delete)(id);
+            self.refresh();
         }
     }
 
@@ -558,6 +739,7 @@ impl Popup {
             }
             let id = self.ids.borrow().get(idx as usize).copied();
             if let Some(id) = id {
+                log::debug!("activating row {idx} (id {id})");
                 self.window.hide();
                 (self.on_activate)(id);
             }
