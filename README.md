@@ -15,7 +15,9 @@ paste something you copied earlier.
 ## Requirements
 
 `clipd` uses GTK3 and X11 directly; there is no runtime dependency on `xclip`,
-`xsel`, `xdotool`, or a GUI toolkit beyond the system GTK3 libraries.
+`xsel`, `xdotool`, or a GUI toolkit beyond the system GTK3 libraries. The
+optional self-updater shells out to `curl` (and `sha256sum`); updates are skipped
+if those are missing.
 
 - A running **X11** session (not Wayland).
 - GTK3 runtime (`libgtk-3-0`) — present on essentially every desktop.
@@ -53,6 +55,7 @@ cargo build --release
 | `clipd` / `clipd toggle` | Show or hide the clipboard popup.              |
 | `clipd show`             | Show the popup.                                |
 | `clipd clear`            | Delete the whole history.                      |
+| `clipd update`           | Check GitHub and install the latest release.   |
 | `clipd quit`             | Stop the daemon.                               |
 
 Once the daemon is running:
@@ -82,6 +85,33 @@ History is unlimited by design. Use `clipd clear` to wipe it, or delete the
 `clipd` works with sensible defaults and needs no configuration. The Ctrl+Alt+V
 binding is grabbed by `clipd` itself while it runs, so you do not need to create a
 desktop shortcut manually.
+
+## Updates
+
+`clipd` updates itself from the project's GitHub releases
+(`aayushpokhrel49/Clipd`). Shortly after start-up, and then every 6 hours, it
+asks GitHub for the newest release; if it is newer than the running version, the
+binary is downloaded, checksum-verified, swapped in place, and the daemon
+restarts automatically. A desktop notification reports what happened.
+
+- `clipd update` forces an update check right away.
+- Auto-update is skipped when running a development build (from `target/`), so
+  `cargo run` and test binaries are never replaced. `clipd update` still works.
+- Set `CLIPD_NO_UPDATE=1` to turn updates off completely.
+- Set `CLIPD_REPO=owner/repo` to point at a fork.
+- The updater uses `curl` (and `sha256sum` when the release ships a
+  `clipd.sha256`) and fails quietly if they are missing.
+
+### Publishing a release
+
+Tag a commit and push the tag; the workflow in `.github/workflows/release.yml`
+builds the binary and attaches `clipd` + `clipd.sha256` to a GitHub release:
+
+```
+# bump `version` in Cargo.toml first
+git tag v0.1.1
+git push origin v0.1.1
+```
 
 ## Uninstall
 

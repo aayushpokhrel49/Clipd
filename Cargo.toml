@@ -1,8 +1,8 @@
 [package]
 name = "clipd"
 version = "0.1.0"
-edition = "2021"
-description = "A lightweight, persistent clipboard manager for X11/Cinnamon"
+edition = "2026"
+description = "A lightweight, persistent clipboard manager"
 
 [[bin]]
 name = "clipd"
