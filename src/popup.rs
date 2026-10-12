@@ -10,12 +10,39 @@ use gtk::{gdk, gdk_pixbuf};
 use crate::store::{self, ClipItem};
 
 pub const WIDTH: i32 = 440;
-pub const HEIGHT: i32 = 470;
+pub const HEIGHT: i32 = 500;
 
 /// Thumbnails are capped so a huge history cannot balloon memory.
 const MAX_THUMBS: usize = 200;
 /// Only this many matching rows are built; refine the search to go deeper.
 const MAX_ROWS: usize = 400;
+/// Text shorter than this many characters counts as a "short"; the rest is "large".
+const SHORT_LIMIT: usize = 500;
+
+/// Category tabs used to split the clipboard history.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Category {
+    All,
+    Images,
+    Url,
+    Shorts,
+    Large,
+}
+
+impl Category {
+    fn matches(self, item: &ClipItem, meta: &RowMeta) -> bool {
+        if item.is_image() {
+            return self == Category::Images;
+        }
+        match self {
+            Category::All => true,
+            Category::Images => false,
+            Category::Url => meta.is_url,
+            Category::Shorts => meta.chars < SHORT_LIMIT,
+            Category::Large => meta.chars >= SHORT_LIMIT,
+        }
+    }
+}
 
 const CSS: &str = r#"
 .clipd-window { background-color: transparent; }
@@ -49,6 +76,33 @@ const CSS: &str = r#"
 .clipd-frame .dim-label { opacity: 0.62; }
 .clipd-footer { padding: 2px 12px 8px 12px; }
 .clipd-footer label { font-size: 90%; }
+.clipd-tabs { margin: 0 10px 6px 10px; }
+.clipd-tabs button {
+  min-height: 26px;
+  padding: 1px 4px;
+  border: none;
+  border-radius: 0;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  font-size: 90%;
+  opacity: 0.7;
+}
+.clipd-tabs button:hover { background-color: alpha(@theme_fg_color, 0.08); opacity: 1; }
+.clipd-tabs button:checked {
+  background-color: alpha(@theme_selected_bg_color, 0.8);
+  color: @theme_selected_fg_color;
+  opacity: 1;
+  font-weight: bold;
+}
+.clipd-tabs button:first-child {
+  border-top-left-radius: 8px;
+  border-bottom-left-radius: 8px;
+}
+.clipd-tabs button:last-child {
+  border-top-right-radius: 8px;
+  border-bottom-right-radius: 8px;
+}
 "#;
 
 fn install_css() {
@@ -73,6 +127,7 @@ struct RowMeta {
     lower: String,
     preview: String,
     chars: usize,
+    is_url: bool,
 }
 
 impl RowMeta {
@@ -83,6 +138,7 @@ impl RowMeta {
                 lower,
                 preview: String::new(),
                 chars: 0,
+                is_url: false,
             }
         } else {
             let text = item.text.as_deref().unwrap_or_default();
@@ -97,9 +153,29 @@ impl RowMeta {
                 lower,
                 preview,
                 chars: text.chars().count(),
+                is_url: looks_like_url(text),
             }
         }
     }
+}
+
+/// Cheap URL sniff for the URL tab: a single-line string that starts with a
+/// known scheme or `www.`. Deliberately conservative to avoid false positives.
+fn looks_like_url(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || t.lines().count() > 1 {
+        return false;
+    }
+    let lower = t.to_ascii_lowercase();
+    const SCHEMES: [&str; 6] = [
+        "http://",
+        "https://",
+        "ftp://",
+        "ftps://",
+        "file://",
+        "mailto:",
+    ];
+    SCHEMES.iter().any(|s| lower.starts_with(s)) || lower.starts_with("www.")
 }
 
 pub struct Popup {
@@ -114,6 +190,8 @@ pub struct Popup {
     on_delete: Rc<dyn Fn(u64)>,
     filter: Rc<RefCell<String>>,
     ids: Rc<RefCell<Vec<u64>>>,
+    category: Rc<Cell<Category>>,
+    tabs: Vec<(Category, gtk::RadioButton)>,
     images_dir: PathBuf,
     thumb_cache: RefCell<HashMap<String, gdk_pixbuf::Pixbuf>>,
     row_cache: RefCell<HashMap<u64, RowMeta>>,
@@ -202,6 +280,40 @@ impl Popup {
         search.set_margin_start(10);
         search.set_margin_end(10);
 
+        // Category tabs: split the history into All / Images / URL / Shorts / Large.
+        let tabs = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        tabs.style_context().add_class("clipd-tabs");
+        tabs.set_homogeneous(true);
+        let mut tab_group: Option<gtk::RadioButton> = None;
+        let mut tab_buttons: Vec<(Category, gtk::RadioButton)> = Vec::new();
+        for (cat, label) in [
+            (Category::All, "All"),
+            (Category::Images, "Images"),
+            (Category::Url, "URL"),
+            (Category::Shorts, "Shorts"),
+            (Category::Large, "Large"),
+        ] {
+            let btn = match &tab_group {
+                Some(first) => gtk::RadioButton::with_label_from_widget(first, label),
+                None => gtk::RadioButton::with_label(label),
+            };
+            btn.set_draw_indicator(false);
+            btn.set_mode(false);
+            btn.set_tooltip_text(Some(match cat {
+                Category::All => "Everything",
+                Category::Images => "Copied images only",
+                Category::Url => "Links only",
+                Category::Shorts => "Text under 500 characters",
+                Category::Large => "Text of 500 characters or more",
+            }));
+            if tab_group.is_none() {
+                btn.set_active(true);
+            }
+            tabs.pack_start(&btn, true, true, 0);
+            tab_buttons.push((cat, btn.clone()));
+            tab_group = Some(btn);
+        }
+
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Single);
         list.set_activate_on_single_click(true);
@@ -209,7 +321,7 @@ impl Popup {
         let scroll = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
         scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         scroll.set_shadow_type(gtk::ShadowType::None);
-        scroll.set_min_content_height(HEIGHT - 136);
+        scroll.set_min_content_height(HEIGHT - 170);
         scroll.add(&list);
 
         let status = gtk::Label::new(None);
@@ -218,9 +330,10 @@ impl Popup {
         status.style_context().add_class("dim-label");
 
         let hint = gtk::Label::new(Some(
-            "\u{2191}\u{2193} move  \u{2022}  \u{21b5} paste  \u{2022}  Del remove  \u{2022}  Esc close",
+            "\u{2191}\u{2193} move  \u{2022}  \u{21b5} paste  \u{2022}  Del remove  \u{2022}  Ctrl+1-5 tabs  \u{2022}  Esc",
         ));
         hint.set_xalign(1.0);
+        hint.set_ellipsize(gtk::pango::EllipsizeMode::End);
         hint.style_context().add_class("dim-label");
 
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -232,6 +345,7 @@ impl Popup {
         frame.style_context().add_class("clipd-frame");
         frame.pack_start(&header, false, false, 0);
         frame.pack_start(&search, false, false, 0);
+        frame.pack_start(&tabs, false, false, 0);
         frame.pack_start(&scroll, true, true, 0);
         frame.pack_start(&footer, false, false, 0);
         window.add(&frame);
@@ -241,6 +355,19 @@ impl Popup {
             let filter = Rc::new(RefCell::new(String::new()));
             let ids = Rc::new(RefCell::new(Vec::new()));
             let opened_at = Rc::new(Cell::new(Instant::now()));
+            let category = Rc::new(Cell::new(Category::All));
+
+            for (cat, btn) in tab_buttons.iter() {
+                let weak = weak.clone();
+                let cat = *cat;
+                btn.connect_toggled(move |b| {
+                    if b.is_active() {
+                        if let Some(p) = weak.upgrade() {
+                            p.set_category(cat);
+                        }
+                    }
+                });
+            }
 
             let drag: Rc<Cell<Option<DragStart>>> = Rc::new(Cell::new(None));
 
@@ -331,7 +458,24 @@ impl Popup {
                 let weak = weak.clone();
                 // Navigation lives here as well as on the list, because some
                 // window/GTK combinations keep keyboard focus on the entry.
-                search.connect_key_press_event(move |_, ev| match ev.keyval() {
+                search.connect_key_press_event(move |_, ev| {
+                    if ev.state().contains(gdk::ModifierType::CONTROL_MASK) {
+                        let cat = match ev.keyval().to_unicode() {
+                            Some('1') => Some(Category::All),
+                            Some('2') => Some(Category::Images),
+                            Some('3') => Some(Category::Url),
+                            Some('4') => Some(Category::Shorts),
+                            Some('5') => Some(Category::Large),
+                            _ => None,
+                        };
+                        if let Some(cat) = cat {
+                            if let Some(p) = weak.upgrade() {
+                                p.set_category(cat);
+                            }
+                            return glib::Propagation::Stop;
+                        }
+                    }
+                    match ev.keyval() {
                     gdk::keys::constants::Down => {
                         if let Some(p) = weak.upgrade() {
                             p.move_selection(1);
@@ -377,6 +521,7 @@ impl Popup {
                         glib::Propagation::Stop
                     }
                     _ => glib::Propagation::Proceed,
+                    }
                 });
             }
 
@@ -520,6 +665,8 @@ impl Popup {
                 on_delete,
                 filter,
                 ids,
+                category,
+                tabs: tab_buttons,
                 images_dir: store::images_dir(),
                 thumb_cache: RefCell::new(HashMap::new()),
                 row_cache: RefCell::new(HashMap::new()),
@@ -528,6 +675,10 @@ impl Popup {
     }
 
     pub fn popup_at(&self, x: i32, y: i32) {
+        self.category.set(Category::All);
+        if let Some((_, btn)) = self.tabs.iter().find(|(c, _)| *c == Category::All) {
+            btn.set_active(true);
+        }
         self.filter.borrow_mut().clear();
         self.search.set_text("");
         self.refresh();
@@ -550,7 +701,7 @@ impl Popup {
             }
         }
 
-        self.scroll.set_min_content_height((height - 136).max(120));
+        self.scroll.set_min_content_height((height - 170).max(120));
         self.window.resize(width, height);
         self.window.deiconify();
         self.window.move_(px, py);
@@ -563,12 +714,26 @@ impl Popup {
         }
     }
 
+    /// Switch the active category tab and rebuild the list.
+    fn set_category(&self, cat: Category) {
+        if self.category.get() == cat {
+            return;
+        }
+        self.category.set(cat);
+        if let Some((_, btn)) = self.tabs.iter().find(|(c, _)| *c == cat) {
+            btn.set_active(true);
+        }
+        self.refresh();
+        self.search.grab_focus();
+    }
+
     pub fn refresh(&self) {
         for child in self.list.children() {
             self.list.remove(&child);
         }
 
         let filter = self.filter.borrow().to_lowercase();
+        let category = self.category.get();
         let history = self.history.borrow();
 
         // Drop cached metadata for items that are no longer in the history.
@@ -601,10 +766,15 @@ impl Popup {
 
         let cache = self.row_cache.borrow();
         let mut matched = 0usize;
+        let mut in_category = 0usize;
         for item in history.iter() {
             let Some(meta) = cache.get(&item.id) else {
                 continue;
             };
+            if !category.matches(item, meta) {
+                continue;
+            }
+            in_category += 1;
             if !filter.is_empty() && !meta.lower.contains(&filter) {
                 continue;
             }
@@ -617,12 +787,12 @@ impl Popup {
         }
         drop(cache);
 
-        let total = history.len();
+        let total = in_category;
         let shown = ids.len();
         drop(ids);
         let status = if shown == 0 {
-            if filter.is_empty() {
-                "No clipboard history yet"
+            if in_category == 0 {
+                "Nothing here yet"
             } else {
                 "No matches"
             }
@@ -639,6 +809,9 @@ impl Popup {
             format!("{matched} matches")
         };
         self.status.set_text(&status);
+        log::debug!(
+            "refresh: category={category:?} total={total} shown={shown} matched={matched}"
+        );
 
         if shown == 0 {
             let row = gtk::ListBoxRow::new();
@@ -811,5 +984,75 @@ impl Popup {
                 gtk::Image::from_icon_name(Some("image-missing"), gtk::IconSize::LargeToolbar)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_item(text: &str) -> ClipItem {
+        ClipItem {
+            id: 1,
+            kind: "text".into(),
+            text: Some(text.into()),
+            image: None,
+            created: 0,
+            hash: 0,
+        }
+    }
+
+    fn image_item() -> ClipItem {
+        ClipItem {
+            id: 2,
+            kind: "image".into(),
+            text: None,
+            image: Some("x.png".into()),
+            created: 0,
+            hash: 0,
+        }
+    }
+
+    #[test]
+    fn url_sniffing() {
+        assert!(looks_like_url("https://example.com/path?q=1"));
+        assert!(looks_like_url("http://example.com"));
+        assert!(looks_like_url("  www.example.com "));
+        assert!(looks_like_url("ftp://files.example.com"));
+        assert!(looks_like_url("mailto:a@b.com"));
+        assert!(!looks_like_url("example.com"));
+        assert!(!looks_like_url("hello world"));
+        assert!(!looks_like_url(""));
+        assert!(!looks_like_url("see https://example.com\nand more"));
+    }
+
+    #[test]
+    fn category_matching() {
+        let image = image_item();
+        let imeta = RowMeta::new(&image);
+
+        let short = text_item("just a short note");
+        let smeta = RowMeta::new(&short);
+
+        let long_text = "x".repeat(SHORT_LIMIT);
+        let long = text_item(&long_text);
+        let lmeta = RowMeta::new(&long);
+
+        let url = text_item("https://example.com");
+        let umeta = RowMeta::new(&url);
+
+        assert!(Category::All.matches(&short, &smeta));
+        assert!(!Category::Images.matches(&short, &smeta));
+        assert!(Category::Images.matches(&image, &imeta));
+        assert!(Category::Shorts.matches(&short, &smeta));
+        assert!(!Category::Large.matches(&short, &smeta));
+        assert!(Category::Large.matches(&long, &lmeta));
+        assert!(!Category::Shorts.matches(&long, &lmeta));
+        assert!(Category::Url.matches(&url, &umeta));
+        assert!(!Category::Url.matches(&short, &smeta));
+        // Images never land in the text-only tabs.
+        assert!(!Category::Url.matches(&image, &imeta));
+        assert!(!Category::Shorts.matches(&image, &imeta));
+        assert!(!Category::Large.matches(&image, &imeta));
     }
 }

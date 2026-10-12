@@ -1,0 +1,56 @@
+# Build .deb, .rpm, Arch (.pkg.tar.zst) and Alpine (.apk) packages from one
+# config using nfpm: https://nfpm.goreleaser.com
+#
+# VERSION and ARCH are supplied by the caller (see build-packages.sh / the
+# release workflow). VERSION is the bare version (no leading "v"); ARCH is a
+# Go/nfpm arch name: amd64 or arm64.
+name: clipd
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+release: "1"
+section: utils
+priority: optional
+maintainer: Aayush Pokhrel <aayushpokhrel49@users.noreply.github.com>
+description: |
+  Lightweight, persistent clipboard manager for the Linux desktop.
+  clipd keeps a searchable, on-disk history of everything you copy (text and
+  images), splits it into All / Images / URL / Shorts / Large tabs, and pastes
+  the chosen item straight into the focused window with Ctrl+Alt+V.
+vendor: clipd
+homepage: https://github.com/aayushpokhrel49/Clipd
+license: MIT
+
+contents:
+  - src: ./dist/clipd
+    dst: /usr/bin/clipd
+    file_info:
+      mode: 0755
+  - src: ./packaging/clipd.desktop
+    dst: /usr/share/applications/clipd.desktop
+  - src: ./packaging/clipd.desktop
+    dst: /etc/xdg/autostart/clipd.desktop
+  - src: ./packaging/clipd.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/clipd.svg
+
+overrides:
+  deb:
+    depends:
+      - libgtk-3-0 | libgtk-3-0t64
+      - libx11-6
+      - libxtst6
+  rpm:
+    depends:
+      - gtk3
+      - libX11
+      - libXtst
+  archlinux:
+    depends:
+      - gtk3
+      - libx11
+      - libxtst
+  apk:
+    depends:
+      - gtk+3.0
+      - libx11
+      - libxtst

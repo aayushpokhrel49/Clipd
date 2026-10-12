@@ -222,6 +222,23 @@ fn run_update(manual: bool) -> anyhow::Result<bool> {
         return Ok(false);
     }
 
+    if update::is_package_managed() {
+        log::info!(
+            "update v{} available (package-managed install; update via your package manager)",
+            release.version
+        );
+        if manual {
+            update::notify(
+                "clipd",
+                &format!(
+                    "v{} is available — update it with your package manager",
+                    release.version
+                ),
+            );
+        }
+        return Ok(false);
+    }
+
     log::info!("installing update v{}...", release.version);
     let path = update::install(&release)?;
     update::notify(

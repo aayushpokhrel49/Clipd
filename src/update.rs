@@ -22,6 +22,25 @@ pub fn is_dev_build() -> bool {
         .unwrap_or(false)
 }
 
+/// True when this executable is owned by the system package manager (a
+/// .deb/.rpm/Arch/Alpine/Flatpak/Snap install under a system prefix). Those
+/// copies live in root-owned directories, so the built-in self-updater cannot
+/// replace them — the user should update through their package manager instead.
+pub fn is_package_managed() -> bool {
+    std::env::current_exe()
+        .map(|p| path_is_package_managed(&p))
+        .unwrap_or(false)
+}
+
+fn path_is_package_managed(p: &Path) -> bool {
+    let p = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let s = p.to_string_lossy();
+    s.starts_with("/usr/")
+        || s.starts_with("/nix/store/")
+        || s.starts_with("/snap/")
+        || s.starts_with("/var/lib/flatpak/")
+}
+
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -303,6 +322,21 @@ mod tests {
         assert!(!is_newer("0.1.0", "0.2.0"));
         assert!(!is_newer("0.2.0-beta", "0.2.0"));
         assert!(is_newer("0.2.1-beta", "0.2.0"));
+    }
+
+    #[test]
+    fn package_managed_detection() {
+        assert!(path_is_package_managed(Path::new("/usr/bin/clipd")));
+        assert!(path_is_package_managed(Path::new("/usr/local/bin/clipd")));
+        assert!(path_is_package_managed(Path::new(
+            "/nix/store/abc-clipd/bin/clipd"
+        )));
+        assert!(!path_is_package_managed(Path::new(
+            "/home/user/.local/bin/clipd"
+        )));
+        assert!(!path_is_package_managed(Path::new(
+            "/media/data/clipboard/target/release/clipd"
+        )));
     }
 
     #[test]

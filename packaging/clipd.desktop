@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=clipd
+Comment=Lightweight persistent clipboard manager
+Exec=clipd start
+Icon=clipd
+Terminal=false
+Categories=Utility;
+NoDisplay=false
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
