@@ -1,0 +1,28 @@
+[package]
+name = "clipd"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight, persistent clipboard manager for X11/Cinnamon"
+
+[[bin]]
+name = "clipd"
+path = "src/main.rs"
+
+[dependencies]
+gtk = "0.18"
+gdk-pixbuf = "0.18"
+glib = "0.18"
+gio = "0.18"
+x11rb = { version = "0.13", default-features = false, features = ["xtest", "xfixes"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
